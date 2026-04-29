@@ -1,0 +1,46 @@
+#version 450
+
+// DeepSeek V4 HC Weighted Sum kernel
+// Each thread computes one output element.
+// Output: dst[d, t] = sum_hc(x[d, hc, t] * weights[hc, t])
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer B0 { float x_data[]; };
+layout(binding = 1) readonly buffer B1 { float weights_data[]; };
+layout(binding = 2) writeonly buffer B2 { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;
+    uint n_hc;
+    uint n_tokens;
+    uint nb_x0;  // x strides (in floats)
+    uint nb_x1;
+    uint nb_x2;
+    uint nb_w0;  // weights strides (in floats)
+    uint nb_w1;
+    uint nb0;    // dst strides (in floats)
+    uint nb1;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint n_elem = pc.n_embd * pc.n_tokens;
+
+    if (gid >= n_elem) {
+        return;
+    }
+
+    const uint d = gid % pc.n_embd;
+    const uint t = gid / pc.n_embd;
+
+    float acc = 0.0f;
+
+    for (uint h = 0; h < pc.n_hc; ++h) {
+        const float xv = x_data[d * pc.nb_x0 + h * pc.nb_x1 + t * pc.nb_x2];
+        const float wv = weights_data[h * pc.nb_w0 + t * pc.nb_w1];
+        acc += xv * wv;
+    }
+
+    dst_data[d * pc.nb0 + t * pc.nb1] = acc;
+}

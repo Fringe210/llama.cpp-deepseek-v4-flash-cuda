@@ -1,0 +1,168 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+// DeepSeek V4 HC Split Sinkhorn kernel
+// Each thread processes one row of the mix tensor.
+// Input: mixes[nrows, mix_hc], scale[3], base[mix_hc]
+// Output: dst[nrows, mix_hc] with Sinkhorn-normalized combination matrix
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer B0 { float mixes_data[]; };
+layout(binding = 1) readonly buffer B1 { float scale_data[]; };
+layout(binding = 2) readonly buffer B2 { float base_data[]; };
+layout(binding = 3) writeonly buffer B3 { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_hc;
+    uint sinkhorn_iters;
+    uint n_rows;
+    uint mix_hc;
+    uint nb01;  // mixes stride (in floats)
+    uint nb_d1;  // dst stride (in floats)
+    float eps;
+} pc;
+
+// E4M3FN value table — precomputed for 127 codes
+// exp=0 (subnormal): mant * 2^-9 = mant * 0.001953125
+// exp>0 (normal):    (1 + mant/8) * 2^(exp-7)
+float dsv4_e4m3fn_value(int i) {
+    int exp = (i >> 3) & 0xf;
+    int mant = i & 0x7;
+    if (exp == 0) {
+        return float(mant) * 0.001953125f;
+    }
+    return (1.0f + float(mant) * 0.125f) * pow(2.0f, float(exp - 7));
+}
+
+float sigmoid(float z) {
+    return 1.0f / (1.0f + exp(-z));
+}
+
+float e4m3fn_dequant(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = min(abs(x), 448.0f);
+
+    int best = 0;
+    float best_diff = ax;
+    for (int i = 1; i < 127; ++i) {
+        float val = dsv4_e4m3fn_value(i);
+        float diff = abs(ax - val);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * dsv4_e4m3fn_value(best);
+}
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n_rows) {
+        return;
+    }
+
+    const uint HC = pc.n_hc;
+    if (HC == 0 || HC > 16) {
+        return;
+    }
+
+    const uint nb01 = pc.nb01;
+    const uint nb_d1 = pc.nb_d1;
+
+    // Pointers (in float units)
+    const uint mix_off = row * nb01;
+    const uint dst_off = row * nb_d1;
+
+    const float pre_scale  = scale_data[0];
+    const float post_scale = scale_data[1];
+    const float comb_scale = scale_data[2];
+    const float epsv = pc.eps;
+
+    // Pre-gate: sigmoid(mix[i] * pre_scale + base[i]) + eps
+    for (uint i = 0; i < HC; ++i) {
+        float z = mixes_data[mix_off + i] * pre_scale + base_data[i];
+        dst_data[dst_off + i] = sigmoid(z) + epsv;
+    }
+
+    // Post-gate: 2 * sigmoid(mix[HC+i] * post_scale + base[HC+i])
+    for (uint i = 0; i < HC; ++i) {
+        uint off = HC + i;
+        float z = mixes_data[mix_off + off] * post_scale + base_data[off];
+        dst_data[dst_off + off] = 2.0f * sigmoid(z);
+    }
+
+    // Combination matrix: softmax + Sinkhorn
+    float c[256];  // 16*16 max
+
+    // Initialize with softmax over src_hc (rows of comb matrix)
+    for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+        float row_max = -3.4028235e+38;
+        for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+            uint idx = src_hc + dst_hc * HC;
+            uint off = 2 * HC + idx;
+            float v = mixes_data[mix_off + off] * comb_scale + base_data[off];
+            c[idx] = v;
+            row_max = max(row_max, v);
+        }
+
+        float row_sum = 0.0f;
+        for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+            uint idx = src_hc + dst_hc * HC;
+            float v = exp(c[idx] - row_max);
+            c[idx] = v;
+            row_sum += v;
+        }
+
+        float inv_sum = 1.0f / row_sum;
+        for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+            uint idx = src_hc + dst_hc * HC;
+            c[idx] = c[idx] * inv_sum + epsv;
+        }
+    }
+
+    // Column normalization (over dst_hc) — first iteration
+    for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+        float sum = 0.0f;
+        for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            sum += c[src_hc + dst_hc * HC];
+        }
+        float inv_denom = 1.0f / (sum + epsv);
+        for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            c[src_hc + dst_hc * HC] *= inv_denom;
+        }
+    }
+
+    // Sinkhorn iterations
+    for (uint iter = 1; iter < pc.sinkhorn_iters; ++iter) {
+        // Row normalization (over dst_hc)
+        for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            float sum = 0.0f;
+            for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+                sum += c[src_hc + dst_hc * HC];
+            }
+            float inv_denom = 1.0f / (sum + epsv);
+            for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+                c[src_hc + dst_hc * HC] *= inv_denom;
+            }
+        }
+
+        // Column normalization (over src_hc)
+        for (uint src_hc = 0; src_hc < HC; ++src_hc) {
+            float sum = 0.0f;
+            for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+                sum += c[src_hc + dst_hc * HC];
+            }
+            float inv_denom = 1.0f / (sum + epsv);
+            for (uint dst_hc = 0; dst_hc < HC; ++dst_hc) {
+                c[src_hc + dst_hc * HC] *= inv_denom;
+            }
+        }
+    }
+
+    // Write combination matrix
+    for (uint i = 0; i < HC * HC; ++i) {
+        dst_data[dst_off + 2 * HC + i] = c[i];
+    }
+}

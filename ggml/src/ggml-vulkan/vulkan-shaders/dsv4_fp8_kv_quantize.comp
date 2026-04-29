@@ -1,0 +1,115 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// DeepSeek V4 FP8 KV Quantize kernel
+// Simulates E4M3FN FP8 round-trip quantization on the non-RoPE prefix.
+// Each workgroup processes one row. 64 threads handle one 64-element block at a time.
+// The RoPE suffix (indices [n_nope, head_dim)) is copied unchanged.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer B0 { float src_data[]; };
+layout(binding = 1) writeonly buffer B1 { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne00;      // head_dim
+    uint ne01;
+    uint ne02;
+    uint ne03;
+    uint nb00;      // src strides (in floats)
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint nb0;       // dst strides (in floats)
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    uint n_nope;    // non-RoPE dimension count (ne00 - n_rot)
+} pc;
+
+// E4M3FN value computation
+float dsv4_e4m3fn_value(int i) {
+    int exp = (i >> 3) & 0xf;
+    int mant = i & 0x7;
+    if (exp == 0) {
+        return float(mant) * 0.001953125f;
+    }
+    return (1.0f + float(mant) * 0.125f) * pow(2.0f, float(exp - 7));
+}
+
+float dsv4_e4m3fn_dequant(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = min(abs(x), 448.0f);
+
+    int best = 0;
+    float best_diff = ax;
+    for (int i = 1; i < 127; ++i) {
+        float val = dsv4_e4m3fn_value(i);
+        float diff = abs(ax - val);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * dsv4_e4m3fn_value(best);
+}
+
+// Shared memory for 64-element block operations
+shared float scratch[64];
+
+void main() {
+    const uint row = gl_GlobalInvocationID.y;
+    const uint n_rows = pc.ne01 * pc.ne02 * pc.ne03;
+
+    if (row >= n_rows) {
+        return;
+    }
+
+    const uint tid = gl_GlobalInvocationID.x;
+
+    // Compute row base offsets
+    const uint i1 = row % pc.ne01;
+    const uint i2 = (row / pc.ne01) % pc.ne02;
+    const uint i3 = row / (pc.ne01 * pc.ne02);
+
+    const uint src_base = i1 * pc.nb01 + i2 * pc.nb02 + i3 * pc.nb03;
+    const uint dst_base = i1 * pc.nb1 + i2 * pc.nb2 + i3 * pc.nb3;
+
+    // Process non-RoPE prefix in 64-element blocks
+    for (uint off = 0; off < pc.n_nope; off += 64) {
+        float v = 0.0f;
+        if (tid < 64) {
+            v = src_data[src_base + (off + tid) * pc.nb00];
+            scratch[tid] = abs(v);
+        }
+        memoryBarrierShared();
+        barrier();
+
+        // Parallel max reduction in shared memory
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            memoryBarrierShared();
+            barrier();
+        }
+
+        float amax = max(scratch[0], 1.0e-4f);
+        float scale = pow(2.0f, ceil(log2(amax / 448.0f)));
+
+        if (tid < 64) {
+            float clamped = clamp(v / scale, -448.0f, 448.0f);
+            float q = dsv4_e4m3fn_dequant(clamped) * scale;
+            dst_data[dst_base + (off + tid) * pc.nb0] = q;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // Copy RoPE suffix unchanged
+    for (uint i = pc.n_nope + tid; i < pc.ne00; i += 64) {
+        dst_data[dst_base + i * pc.nb0] = src_data[src_base + i * pc.nb00];
+    }
+}

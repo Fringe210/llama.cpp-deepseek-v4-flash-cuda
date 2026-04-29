@@ -6,6 +6,7 @@
 
 layout(local_size_x = 1, local_size_y = 256, local_size_z = 1) in;
 
+#define ROPE_DATA_A 1
 layout (binding = 0) readonly buffer X {A_TYPE rope_data_a[];};
 layout (binding = 1) readonly buffer Y {int rope_data_pos[];};
 layout (binding = 2) readonly buffer Z {float rope_data_ff[];};

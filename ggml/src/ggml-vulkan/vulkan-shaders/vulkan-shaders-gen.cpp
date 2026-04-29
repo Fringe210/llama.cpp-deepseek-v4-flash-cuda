@@ -938,6 +938,13 @@ void process_shaders() {
     string_to_spv("rope_neox_f16", "rope_neox.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
     string_to_spv("rope_neox_f32_f16", "rope_neox.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}});
 
+   string_to_spv("dsv4_rope_tail_f32", "dsv4_rope_tail.comp", {{"A_TYPE", "float"}, {"A_TYPE_SIZE", "4"}});
+
+    string_to_spv("dsv4_hc_split_sinkhorn_f32", "dsv4_hc_split_sinkhorn.comp", {});
+    string_to_spv("dsv4_hc_expand_f32", "dsv4_hc_expand.comp", {});
+    string_to_spv("dsv4_hc_weighted_sum_f32", "dsv4_hc_weighted_sum.comp", {});
+    string_to_spv("dsv4_fp8_kv_quantize_f32", "dsv4_fp8_kv_quantize.comp", {});
+
     string_to_spv("rope_multi_f32", "rope_multi.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
     string_to_spv("rope_multi_f16", "rope_multi.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
     string_to_spv("rope_multi_f32_f16", "rope_multi.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}});

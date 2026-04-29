@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+// DeepSeek V4 HC Expand kernel
+// Each thread computes one output element.
+// Output: dst[d, dst_hc, t] = block_out[d, t] * post[dst_hc, t] + sum(src_hc, comb[dst_hc, src_hc, t] * residual[d, src_hc, t])
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer B0 { float block_out_data[]; };
+layout(binding = 1) readonly buffer B1 { float residual_data[]; };
+layout(binding = 2) readonly buffer B2 { float post_data[]; };
+layout(binding = 3) readonly buffer B3 { float comb_data[]; };
+layout(binding = 4) writeonly buffer B4 { float dst_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_embd;
+    uint n_hc;
+    uint n_tokens;
+    uint nb_block0;  // block_out strides (in floats)
+    uint nb_block1;
+    uint nb_res0;    // residual strides (in floats)
+    uint nb_res1;
+    uint nb_res2;
+    uint nb_post0;   // post strides (in floats)
+    uint nb_post1;
+    uint nb_comb0;   // comb strides (in floats)
+    uint nb_comb1;
+    uint nb_comb2;
+    uint nb0;        // dst strides (in floats)
+    uint nb1;
+    uint nb2;
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint n_elem = pc.n_embd * pc.n_hc * pc.n_tokens;
+
+    if (gid >= n_elem) {
+        return;
+    }
+
+    const uint d = gid % pc.n_embd;
+    const uint tmp = gid / pc.n_embd;
+    const uint dst_hc = tmp % pc.n_hc;
+    const uint t = tmp / pc.n_hc;
+
+    // block_out[d, t]
+    const float block_v = block_out_data[d * pc.nb_block0 + t * pc.nb_block1];
+    // post[dst_hc, t]
+    const float post_v = post_data[dst_hc * pc.nb_post0 + t * pc.nb_post1];
+
+    float acc = block_v * post_v;
+
+    // Matrix-vector product: sum over src_hc
+    for (uint src_hc = 0; src_hc < pc.n_hc; ++src_hc) {
+        // comb[dst_hc, src_hc, t]
+        const float comb_v = comb_data[dst_hc * pc.nb_comb0 + src_hc * pc.nb_comb1 + t * pc.nb_comb2];
+        // residual[d, src_hc, t]
+        const float res_v = residual_data[d * pc.nb_res0 + src_hc * pc.nb_res1 + t * pc.nb_res2];
+        acc += comb_v * res_v;
+    }
+
+    // dst[d, dst_hc, t]
+    dst_data[d * pc.nb0 + dst_hc * pc.nb1 + t * pc.nb2] = acc;
+}

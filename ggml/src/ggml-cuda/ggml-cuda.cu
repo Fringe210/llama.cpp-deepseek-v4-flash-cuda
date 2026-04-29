@@ -2947,6 +2947,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:
             ggml_cuda_op_dsv4_fp8_kv_quantize(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            ggml_cuda_op_dsv4_hc_weighted_sum(ctx, dst);
+            break;
         case GGML_OP_DSV4_ROPE_TAIL:
             ggml_cuda_op_dsv4_rope_tail(ctx, dst);
             break;
@@ -5194,6 +5197,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_op_dsv4_hc_expand_supported();
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:
             return ggml_cuda_op_dsv4_fp8_kv_quantize_supported();
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            return ggml_cuda_op_dsv4_hc_weighted_sum_supported();
 
         default:
             return false;

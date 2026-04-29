@@ -11,6 +11,7 @@ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 // data is passed from rms_norm -> rope through shared memory.
 // rms_norm calls this data_d, rope calls this rope_data_a.
 // Binding 2 is not used
+#define ROPE_DATA_A 1
 shared FLOAT_TYPE rope_data_a[1024];
 #define data_d rope_data_a
 

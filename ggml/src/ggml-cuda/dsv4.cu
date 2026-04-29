@@ -109,6 +109,19 @@ struct ggml_cuda_kargs_dsv4_fp8_kv_quantize {
     int32_t  n_rot;
 };
 
+struct ggml_cuda_kargs_dsv4_hc_weighted_sum {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb0;
+    uint64_t nb1;
+};
+
 struct ggml_cuda_kargs_dsv4_rope_tail {
     int64_t  ne00;
     int64_t  ne01;
@@ -411,6 +424,30 @@ static __global__ void kernel_dsv4_rope_tail_f32(
     }
 }
 
+static __global__ void kernel_dsv4_hc_weighted_sum(
+        const ggml_cuda_kargs_dsv4_hc_weighted_sum args,
+        const char * x,
+        const char * weights,
+        char * dst) {
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        const float xv = *((const float *) (x     + d * args.nb_x0 + h * args.nb_x1 + t * args.nb_x2));
+        const float wv = *((const float *) (weights + h * args.nb_w0 + t * args.nb_w1));
+        acc += xv * wv;
+    }
+
+    *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
+}
+
 } // namespace
 
 bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -568,6 +605,55 @@ bool ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
     kernel_dsv4_fp8_kv_quantize<<<n_rows, 64, 0, stream>>>(
         args,
         (const char *) src0->data,
+        (char *) dst->data);
+
+    return true;
+}
+
+bool ggml_cuda_op_dsv4_hc_weighted_sum_supported(void) {
+    return true;
+}
+
+bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[3]       == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(dst->ne[2]     == 1);
+    GGML_ASSERT(dst->ne[3]     == 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_hc     = x->ne[1];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_elem   = n_embd * n_tokens;
+
+    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    const int n_tg = (n_elem + nth - 1) / nth;
+
+    ggml_cuda_kargs_dsv4_hc_weighted_sum args = {
+        /*.n_embd  =*/ n_embd,
+        /*.n_hc    =*/ n_hc,
+        /*.n_tokens =*/ n_tokens,
+        /*.nb_x0   =*/ x->nb[0],
+        /*.nb_x1   =*/ x->nb[1],
+        /*.nb_x2   =*/ x->nb[2],
+        /*.nb_w0   =*/ weights->nb[0],
+        /*.nb_w1   =*/ weights->nb[1],
+        /*.nb0     =*/ dst->nb[0],
+        /*.nb1     =*/ dst->nb[1],
+    };
+
+    const cudaStream_t stream = ctx.stream();
+
+    kernel_dsv4_hc_weighted_sum<<<n_tg, nth, 0, stream>>>(
+        args,
+        (const char *) x->data,
+        (const char *) weights->data,
         (char *) dst->data);
 
     return true;

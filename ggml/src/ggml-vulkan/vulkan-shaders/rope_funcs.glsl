@@ -34,6 +34,7 @@ void rope_yarn(const float theta_extrap, const uint i0, out float cos_theta, out
     sin_theta = sin(theta) * mscale;
 }
 
+#if defined(ROPE_DATA_A)
 void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
     if (i0 >= p.ne00) {
         return;
@@ -204,4 +205,5 @@ void rope_vision(const uint i0, const uint i1, const uint i2, const uint i3, rop
     rope_data_d[idst + 0]        = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
     rope_data_d[idst + p.n_dims] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
 }
+#endif
 
