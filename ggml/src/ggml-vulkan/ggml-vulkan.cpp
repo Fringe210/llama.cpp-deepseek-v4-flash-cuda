@@ -4712,7 +4712,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_rope_norm_f32_f16, "rope_norm_f32_f16", rope_norm_f32_f16_len, rope_norm_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32_f16, "rope_neox_f32_f16", rope_neox_f32_f16_len, rope_neox_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32_f16, "rope_multi_f32_f16", rope_multi_f32_f16_len, rope_multi_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_rope_tail_f32, "dsv4_rope_tail_f32", dsv4_rope_tail_f32_len, dsv4_rope_tail_f32_data, "main", 3, sizeof(vk_op_dsv4_rope_tail_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_rope_tail_f32, "dsv4_rope_tail_f32", dsv4_rope_tail_f32_len, dsv4_rope_tail_f32_data, "main", 4, sizeof(vk_op_dsv4_rope_tail_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_split_sinkhorn_f32, "dsv4_hc_split_sinkhorn_f32", dsv4_hc_split_sinkhorn_f32_len, dsv4_hc_split_sinkhorn_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_split_sinkhorn_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_expand_f32, "dsv4_hc_expand_f32", dsv4_hc_expand_f32_len, dsv4_hc_expand_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_expand_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_weighted_sum_f32, "dsv4_hc_weighted_sum_f32", dsv4_hc_weighted_sum_f32_len, dsv4_hc_weighted_sum_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_weighted_sum_push_constants), {256, 1, 1}, {}, 1);
@@ -6695,6 +6695,10 @@ template <typename T, uint32_t N> const T *push_constant_data(const std::array<T
 
 template <typename T>
 static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+    if (!pipeline || !pipeline->wg_denoms[0] || !pipeline->wg_denoms[1] || !pipeline->wg_denoms[2]) {
+        GGML_LOG_ERROR("%s: invalid pipeline or wg_denoms\n", __func__);
+        return;
+    }
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
@@ -9824,7 +9828,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_DSV4_HC_EXPAND:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->src[3]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_dsv4_hc_expand_f32;
         }
         return nullptr;
@@ -10696,10 +10700,17 @@ static void ggml_vk_dsv4_rope_tail(ggml_backend_vk_context * ctx, vk_context& su
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
 
+    if (!src0 || !src1) {
+        return;
+    }
+
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
+    if (!dst->op_params) {
+        return;
+    }
     const int n_dims     = ggml_get_op_params_i32(dst, 0);
     const int mode       = ggml_get_op_params_i32(dst, 1);
     const int n_ctx_orig = ggml_get_op_params_i32(dst, 2);
@@ -10750,13 +10761,13 @@ static void ggml_vk_dsv4_rope_tail(ggml_backend_vk_context * ctx, vk_context& su
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_rope_tail_f32;
-    GGML_ASSERT(pipeline != nullptr);
+    if (!pipeline) { GGML_LOG_ERROR("%s: null pipeline dsv4_rope_tail_f32\n", __func__); return; }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
     vk_subbuffer src1_buf = ggml_vk_tensor_subbuffer(ctx, src1, true);
-    vk_subbuffer src2_buf = src2 ? ggml_vk_tensor_subbuffer(ctx, src2, true) : vk_subbuffer{};
+    vk_subbuffer src2_buf = src2 ? ggml_vk_tensor_subbuffer(ctx, src2, true) : src0_buf;
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
 
     std::array<uint32_t, 3> elements = { nrows, 1, 1 };
@@ -10770,6 +10781,10 @@ static void ggml_vk_dsv4_hc_split_sinkhorn(ggml_backend_vk_context * ctx, vk_con
     const ggml_tensor * src0 = dst->src[0];  // mixes
     const ggml_tensor * src1 = dst->src[1];  // scale
     const ggml_tensor * src2 = dst->src[2];  // base
+
+    if (!src2) {
+        return;
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -10797,7 +10812,7 @@ static void ggml_vk_dsv4_hc_split_sinkhorn(ggml_backend_vk_context * ctx, vk_con
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_split_sinkhorn_f32;
-    GGML_ASSERT(pipeline != nullptr);
+    if (!pipeline) { GGML_LOG_ERROR("%s: null pipeline dsv4_hc_split_sinkhorn_f32\n", __func__); return; }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -10818,6 +10833,10 @@ static void ggml_vk_dsv4_hc_expand(ggml_backend_vk_context * ctx, vk_context& su
     const ggml_tensor * src1 = dst->src[1];  // residual
     const ggml_tensor * src2 = dst->src[2];  // post
     const ggml_tensor * src3 = dst->src[3];  // comb
+
+    if (!src3) {
+        return;
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -10850,7 +10869,7 @@ static void ggml_vk_dsv4_hc_expand(ggml_backend_vk_context * ctx, vk_context& su
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_expand_f32;
-    GGML_ASSERT(pipeline != nullptr);
+    if (!pipeline) { GGML_LOG_ERROR("%s: null pipeline dsv4_hc_expand_f32\n", __func__); return; }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -10870,6 +10889,10 @@ static void ggml_vk_dsv4_hc_expand(ggml_backend_vk_context * ctx, vk_context& su
 static void ggml_vk_dsv4_hc_weighted_sum(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
+
+    if (!x || !weights) {
+        return;
+    }
 
     GGML_ASSERT(x->type       == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -10894,7 +10917,7 @@ static void ggml_vk_dsv4_hc_weighted_sum(ggml_backend_vk_context * ctx, vk_conte
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_weighted_sum_f32;
-    GGML_ASSERT(pipeline != nullptr);
+    if (!pipeline) { GGML_LOG_ERROR("%s: null pipeline dsv4_hc_weighted_sum_f32\n", __func__); return; }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -10911,6 +10934,10 @@ static void ggml_vk_dsv4_hc_weighted_sum(ggml_backend_vk_context * ctx, vk_conte
 
 static void ggml_vk_dsv4_fp8_kv_quantize(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+
+    if (!src0) {
+        return;
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -10938,7 +10965,7 @@ static void ggml_vk_dsv4_fp8_kv_quantize(ggml_backend_vk_context * ctx, vk_conte
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_fp8_kv_quantize_f32;
-    GGML_ASSERT(pipeline != nullptr);
+    if (!pipeline) { GGML_LOG_ERROR("%s: null pipeline dsv4_fp8_kv_quantize_f32\n", __func__); return; }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -13317,7 +13344,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
     }
 
-    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
@@ -13421,7 +13448,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
     }
 
-    switch (node->op) {
+ switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
 
@@ -13730,24 +13757,20 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
-    case GGML_OP_DSV4_ROPE_TAIL:
+case GGML_OP_DSV4_ROPE_TAIL:
         ggml_vk_dsv4_rope_tail(ctx, compute_ctx, node);
-
         break;
 
     case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         ggml_vk_dsv4_hc_split_sinkhorn(ctx, compute_ctx, node);
-
         break;
 
     case GGML_OP_DSV4_HC_EXPAND:
         ggml_vk_dsv4_hc_expand(ctx, compute_ctx, node);
-
         break;
 
     case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         ggml_vk_dsv4_hc_weighted_sum(ctx, compute_ctx, node);
-
         break;
 
     case GGML_OP_DSV4_FP8_KV_QUANTIZE:
@@ -14321,7 +14344,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
             return false;
-        }
+    }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
@@ -16195,9 +16218,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DSV4_ROPE_TAIL:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            return op->src[0] && op->src[1] && op->src[2]
+                && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_EXPAND:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            return op->src[0] && op->src[1] && op->src[2] && op->src[3]
+                && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:

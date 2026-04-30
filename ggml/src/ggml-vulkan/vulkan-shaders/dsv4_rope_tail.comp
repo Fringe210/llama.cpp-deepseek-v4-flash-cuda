@@ -6,7 +6,8 @@
 
 #include "rope_params.glsl"
 
-layout(local_size_x = 1, local_size_y = 256, local_size_z = 1) in;
+// Must match pipeline wg_denoms {512, 1, 1} in ggml-vulkan.cpp
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer X {A_TYPE src_data[];};
 layout(binding = 1) readonly buffer Y {int32_t pos_data[];};
@@ -20,7 +21,7 @@ layout(push_constant) uniform parameter {
 #include "rope_funcs.glsl"
 
 void main() {
-    const uint row = gl_GlobalInvocationID.x + 32768 * gl_GlobalInvocationID.z;
+    const uint row = gl_GlobalInvocationID.x;
     if (row >= pc.nrows) {
         return;
     }
@@ -33,17 +34,16 @@ void main() {
     const uint nb01 = pc.nb01 / A_TYPE_SIZE;
     const uint nb11 = pc.nb11 / A_TYPE_SIZE;
 
-    const int32_t theta_base = pos_data[i2];
+    const float theta_base = float(pos_data[i2]);
 
     const uint n_nope = pc.ne00 - pc.n_dims;
 
     // Process all elements in this row
     for (uint i0_base = 0; i0_base < pc.ne00; i0_base += 1) {
-        const uint src_idx = i0_base + nb01 * i1 + pc.ne01 * nb01 * i2 + pc.ne01 * pc.ne02 * nb01 * i3;
-        const uint dst_idx = i0_base + nb11 * i1 + pc.ne01 * nb11 * i2 + pc.ne01 * pc.ne02 * nb11 * i3;
-
         // Copy non-rotated elements (nope part) directly
         if (i0_base < n_nope) {
+            const uint src_idx = i0_base + nb01 * i1 + pc.ne01 * nb01 * i2 + pc.ne01 * pc.ne02 * nb01 * i3;
+            const uint dst_idx = i0_base + nb11 * i1 + pc.ne01 * nb11 * i2 + pc.ne01 * pc.ne02 * nb11 * i3;
             dst_data[dst_idx] = src_data[src_idx];
             continue;
         }
@@ -54,21 +54,19 @@ void main() {
         if (pc.rope_mode == 2) { // Neox mode
             const uint n_half = pc.n_dims / 2;
             if (r >= n_half) {
+                const uint src_idx = i0_base + nb01 * i1 + pc.ne01 * nb01 * i2 + pc.ne01 * pc.ne02 * nb01 * i3;
+                const uint dst_idx = i0_base + nb11 * i1 + pc.ne01 * nb11 * i2 + pc.ne01 * pc.ne02 * nb11 * i3;
                 dst_data[dst_idx] = src_data[src_idx];
                 continue;
             }
 
             const uint ic = r;
             const uint rel_i0 = 2 * ic;
-            const float theta = theta_base * pow(pc.freq_base, pc.theta_scale * rel_i0);
+            const float theta = theta_base * pow(pc.freq_base, pc.theta_scale * float(rel_i0));
             const float freq_factor = pc.has_ff != 0 ? freq_factors[ic] : 1.0f;
 
             float cos_theta, sin_theta;
             rope_yarn(theta / freq_factor, rel_i0, cos_theta, sin_theta, pc);
-
-            if (pc.is_back != 0) {
-                sin_theta = -sin_theta;
-            }
 
             // Process the pair: positions (n_nope + ic) and (n_nope + ic + n_half)
             const uint j0 = n_nope + ic;
@@ -89,20 +87,18 @@ void main() {
             i0_base += 1;
         } else { // Interleaved mode
             if ((r & 1) != 0) {
+                const uint src_idx = i0_base + nb01 * i1 + pc.ne01 * nb01 * i2 + pc.ne01 * pc.ne02 * nb01 * i3;
+                const uint dst_idx = i0_base + nb11 * i1 + pc.ne01 * nb11 * i2 + pc.ne01 * pc.ne02 * nb11 * i3;
                 dst_data[dst_idx] = src_data[src_idx];
                 continue;
             }
 
             const uint ic = r / 2;
-            const float theta = theta_base * pow(pc.freq_base, pc.theta_scale * r);
+            const float theta = theta_base * pow(pc.freq_base, pc.theta_scale * float(r));
             const float freq_factor = pc.has_ff != 0 ? freq_factors[ic] : 1.0f;
 
             float cos_theta, sin_theta;
             rope_yarn(theta / freq_factor, r, cos_theta, sin_theta, pc);
-
-            if (pc.is_back != 0) {
-                sin_theta = -sin_theta;
-            }
 
             // Process the pair: positions (n_nope + r) and (n_nope + r + 1)
             const uint j0 = n_nope + r;
